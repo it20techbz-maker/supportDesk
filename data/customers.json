@@ -1,0 +1,4 @@
+{
+  "+60120000001": { "company": "A Bank", "type": "bank", "contact": "Adam" },
+  "+60120000002": { "company": "B Securities", "type": "stock", "contact": "Mei Ling" }
+}
