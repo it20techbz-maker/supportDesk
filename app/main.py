@@ -1,13 +1,17 @@
 """Web service and test console.
 
-Phase 1: every outside connection is a fake. Nothing is sent to WhatsApp, the
-ticketing system or email. Messages are typed into the test console instead.
+Phase 1: the ticketing system and email are fakes, and WhatsApp is a fake unless
+the Baileys bridge is switched on. Messages can be typed into the test console.
+
+Runs on one machine with SQLite, or on Vercel with a Supabase (Postgres) database.
 """
+import base64
 import os
+import secrets
 from typing import List, Optional
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel
 
 from .connectors.email import FakeEmail
@@ -16,7 +20,7 @@ from .connectors.whatsapp import BaileysWhatsApp, FakeWhatsApp, WhatsAppUnavaila
 from .customers import Customers
 from .knowledge import Knowledge
 from .pipeline import Pipeline
-from .store import Store
+from .store import PostgresStore, Store
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -27,12 +31,17 @@ def build_pipeline(db_path=None):
         from .ai import ClaudeAI
 
         ai = ClaudeAI()
+    database_url = os.environ.get("DATABASE_URL", "")
+    if database_url and not db_path:
+        store = PostgresStore(database_url)
+    else:
+        store = Store(db_path or os.environ.get("DB_PATH", os.path.join(ROOT, "data", "support.db")))
     return Pipeline(
-        store=Store(db_path or os.environ.get("DB_PATH", os.path.join(ROOT, "data", "support.db"))),
+        store=store,
         customers=Customers(os.environ.get("CUSTOMERS_FILE", os.path.join(ROOT, "data", "customers.json"))),
         knowledge=Knowledge(os.environ.get("KNOWLEDGE_DIR", os.path.join(ROOT, "knowledge"))),
         whatsapp=_whatsapp(),
-        ticketing=FakeTicketing(),
+        ticketing=FakeTicketing(store),
         email=FakeEmail(),
         support_email=os.environ.get("SUPPORT_EMAIL", "support-team@example.com"),
         ai=ai,
@@ -48,12 +57,45 @@ def _whatsapp():
     return BaileysWhatsApp(os.environ.get("BRIDGE_URL", "http://127.0.0.1:8766"), token)
 
 
-def create_app(pipeline=None):
-    app = FastAPI(title="Support Desk")
-    p = pipeline or build_pipeline()
-    # Continue ticket numbers after the ones already stored, so a restart does not reuse them.
-    for row in p.store.all("select ext_id from tickets"):
-        p.ticketing.tickets.setdefault(row["ext_id"], {})
+def _missing_settings():
+    """On Vercel the console is on the public internet, so it must have a database and a password."""
+    if not os.environ.get("VERCEL"):
+        return []
+    return [name for name in ("DATABASE_URL", "CONSOLE_PASSWORD") if not os.environ.get(name)]
+
+
+def _authorised(request, user, password):
+    bridge_token = os.environ.get("BRIDGE_TOKEN", "")
+    if request.url.path == "/api/incoming" and bridge_token:
+        if secrets.compare_digest(request.headers.get("x-bridge-token", ""), bridge_token):
+            return True
+    scheme, _, encoded = request.headers.get("authorization", "").partition(" ")
+    if scheme.lower() != "basic":
+        return False
+    try:
+        given_user, _, given_password = base64.b64decode(encoded).decode("utf-8").partition(":")
+    except ValueError:
+        return False
+    return secrets.compare_digest(given_user, user) and secrets.compare_digest(given_password, password)
+
+
+def create_app(pipeline=None, password=None):
+    app = FastAPI(title="Support Desk", docs_url=None, redoc_url=None, openapi_url=None)
+    missing = [] if pipeline else _missing_settings()
+    p = pipeline or (None if missing else build_pipeline())
+    user = os.environ.get("CONSOLE_USER", "admin")
+    password = password if password is not None else os.environ.get("CONSOLE_PASSWORD", "")
+
+    @app.middleware("http")
+    async def guard(request: Request, call_next):
+        if missing:
+            return JSONResponse(
+                {"detail": "Not configured. Set these environment variables in Vercel and redeploy: " + ", ".join(missing)},
+                status_code=503,
+            )
+        if password and not _authorised(request, user, password):
+            return Response("Sign in required", status_code=401, headers={"WWW-Authenticate": 'Basic realm="Support Desk"'})
+        return await call_next(request)
 
     class Incoming(BaseModel):
         phone: str

@@ -51,7 +51,7 @@ async function forward(message) {
   try {
     const response = await fetch(SUPPORT_DESK_URL + '/api/incoming', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'X-Bridge-Token': TOKEN },
       body: JSON.stringify({ phone: '+' + phone, text, voice_note: voiceNote, attachments }),
     })
     if (!response.ok) console.error('Support desk rejected a message:', response.status)

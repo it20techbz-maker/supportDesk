@@ -242,3 +242,81 @@ def test_baileys_connector_posts_to_bridge_and_reports_refusals():
         server.shutdown()
     with pytest.raises(WhatsAppUnavailable):
         BaileysWhatsApp(url, "secret", timeout=2).send(BANK, "hello")
+
+
+def test_console_requires_sign_in_when_a_password_is_set(p, monkeypatch):
+    client = TestClient(create_app(p, password="s3cret"))
+    assert client.get("/").status_code == 401
+    assert client.get("/api/state").status_code == 401
+    assert client.get("/api/state", auth=("admin", "wrong")).status_code == 401
+    assert client.get("/api/state", auth=("admin", "s3cret")).status_code == 200
+    body = {"phone": BANK, "text": UT67890}
+    assert client.post("/api/incoming", json=body, headers={"X-Bridge-Token": "tok"}).status_code == 401
+    monkeypatch.setenv("BRIDGE_TOKEN", "tok")
+    assert client.post("/api/incoming", json=body, headers={"X-Bridge-Token": "bad"}).status_code == 401
+    assert client.post("/api/incoming", json=body, headers={"X-Bridge-Token": "tok"}).status_code == 200
+    assert client.get("/api/state", headers={"X-Bridge-Token": "tok"}).status_code == 401
+
+
+def test_on_vercel_refuses_to_run_without_database_and_password(monkeypatch):
+    monkeypatch.setenv("VERCEL", "1")
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("CONSOLE_PASSWORD", raising=False)
+    response = TestClient(create_app()).get("/api/state")
+    assert response.status_code == 503
+    assert "DATABASE_URL" in response.json()["detail"] and "CONSOLE_PASSWORD" in response.json()["detail"]
+
+
+def test_vercel_entry_point_exposes_the_app():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("vercel_entry", os.path.join(ROOT, "api", "index.py"))
+    module = importlib.util.module_from_spec(spec)
+    os.environ["SUPPORT_DESK_NO_APP"] = "1"
+    spec.loader.exec_module(module)
+    assert hasattr(module, "app")
+
+
+@pytest.fixture(scope="module")
+def postgres_url(tmp_path_factory):
+    pgserver = pytest.importorskip("pgserver")
+    server = pgserver.get_server(str(tmp_path_factory.mktemp("pg")))
+    yield server.get_uri()
+    server.cleanup()
+
+
+def test_full_flow_on_postgres(postgres_url):
+    from app.store import PostgresStore
+
+    store = PostgresStore(postgres_url)
+    PostgresStore(postgres_url)  # creating the tables twice must be harmless
+    for table in ("inbound", "tickets", "outbox", "emails", "pending", "audit", "settings"):
+        store.run("delete from " + table)
+    pg = Pipeline(
+        store=store,
+        customers=Customers(os.path.join(ROOT, "data", "customers.json")),
+        knowledge=Knowledge(os.path.join(ROOT, "knowledge")),
+        whatsapp=FakeWhatsApp(),
+        ticketing=FakeTicketing(store),
+        email=FakeEmail(),
+        support_email="support@test",
+        clock=Clock(),
+    )
+    pg.ticketing.down = True
+    pg.handle_incoming(BANK, UT67890)
+    assert pg.stats()["waiting_for_ticket_system"] == 1
+    pg.ticketing.down = False
+    assert pg.retry_pending() == 1
+    ticket = store.one("select * from tickets")
+    assert ticket["ext_id"] == "TCK-0001" and ticket["priority"] == "URGENT"
+    assert pg.handle_incoming(BANK, "Any update on TCK-0001?")["type"] == C.FOLLOW_UP
+    assert "FOLLOW-UP" in store.one("select * from tickets")["body"]
+    pg.handle_incoming(STOCK, "The UAT month end report total is wrong.")
+    assert store.one("select * from tickets where phone = ?", (STOCK,))["ext_id"] == "TCK-0002"
+    draft_id = pg.post_root_cause(ticket["id"], "Lock wait timeout", "Devi")
+    assert pg.approve(draft_id, "Yvonne") == "freeform"
+    assert store.one("select * from tickets where id = ?", (ticket["id"],))["status"] == "replied"
+    assert [t["ext_id"] for t in pg.reminders()] == []
+    assert pg.stats()["tickets_by_status"] == {"replied": 1, "open": 1}
+    rls = store.all("select relname from pg_class where relrowsecurity and relname in ('tickets', 'inbound', 'outbox')")
+    assert len(rls) == 3
