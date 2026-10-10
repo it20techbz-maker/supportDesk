@@ -320,3 +320,13 @@ def test_full_flow_on_postgres(postgres_url):
     assert pg.stats()["tickets_by_status"] == {"replied": 1, "open": 1}
     rls = store.all("select relname from pg_class where relrowsecurity and relname in ('tickets', 'inbound', 'outbox')")
     assert len(rls) == 3
+
+
+def test_bad_database_url_is_explained_after_sign_in_instead_of_crashing(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://nobody:x@127.0.0.1:1/postgres?connect_timeout=2")
+    client = TestClient(create_app(password="s3cret"))
+    assert client.get("/api/state").status_code == 401
+    response = client.get("/api/state", auth=("admin", "s3cret"))
+    assert response.status_code == 503
+    assert "Could not connect to the database" in response.json()["detail"]
+    assert "x@" not in response.json()["detail"]

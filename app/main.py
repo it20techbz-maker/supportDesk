@@ -64,6 +64,17 @@ def _missing_settings():
     return [name for name in ("DATABASE_URL", "CONSOLE_PASSWORD") if not os.environ.get(name)]
 
 
+def _explain_startup(exc):
+    reason = " ".join(str(exc).split())[:300]
+    if os.environ.get("DATABASE_URL"):
+        return (
+            "Could not connect to the database. Check DATABASE_URL: copy it again from your own Supabase "
+            "project (Connect > Transaction pooler, port 6543), replace [YOUR-PASSWORD] with the database "
+            "password, save it in Vercel and redeploy. Database said: " + reason
+        )
+    return "Could not start: %s: %s" % (type(exc).__name__, reason)
+
+
 def _authorised(request, user, password):
     bridge_token = os.environ.get("BRIDGE_TOKEN", "")
     if request.url.path == "/api/incoming" and bridge_token:
@@ -82,7 +93,13 @@ def _authorised(request, user, password):
 def create_app(pipeline=None, password=None):
     app = FastAPI(title="Support Desk", docs_url=None, redoc_url=None, openapi_url=None)
     missing = [] if pipeline else _missing_settings()
-    p = pipeline or (None if missing else build_pipeline())
+    p, startup_error = pipeline, ""
+    if not p and not missing:
+        try:
+            p = build_pipeline()
+        except Exception as exc:
+            # Keep serving, so the reason is shown on the page instead of a bare crash.
+            startup_error = _explain_startup(exc)
     user = os.environ.get("CONSOLE_USER", "admin")
     password = password if password is not None else os.environ.get("CONSOLE_PASSWORD", "")
 
@@ -95,6 +112,8 @@ def create_app(pipeline=None, password=None):
             )
         if password and not _authorised(request, user, password):
             return Response("Sign in required", status_code=401, headers={"WWW-Authenticate": 'Basic realm="Support Desk"'})
+        if startup_error:
+            return JSONResponse({"detail": startup_error}, status_code=503)
         return await call_next(request)
 
     class Incoming(BaseModel):
